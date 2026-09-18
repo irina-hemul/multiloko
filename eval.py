@@ -110,27 +110,27 @@ PREFIX_ARTICLES = {
 
 
 def remove_articles(text: str, language: str = "english") -> str:
+    """Drops the language's articles, leaving whitespace tidy."""
     if language in PREFIX_ARTICLES:
+        # Arabic and Hebrew fuse the article onto the word. Strip one prefix,
+        # and only when two characters would remain: a noun may legitimately
+        # begin with that letter (Hebrew "הר", mountain).
         prefix = PREFIX_ARTICLES[language]
+        words = [
+            word[len(prefix):]
+            if word.startswith(prefix) and len(word) >= len(prefix) + 2
+            else word
+            for word in text.split()
+        ]
+        return " ".join(words)
 
-        def strip_prefix(word: str) -> str:
-            # Strip to a fixed point, so that a noun which itself begins with
-            # the article letter compares equal with and without the article:
-            # Hebrew gold "ההתנתקות" and a bare prediction "התנתקות" must both
-            # land on the same form. Only strip while at least two characters
-            # remain — a one-character remainder (eg "הר" -> "ר") is far more
-            # likely to be a word that merely starts with that letter.
-            while word.startswith(prefix) and len(word) >= len(prefix) + 2:
-                word = word[len(prefix):]
-            return word
-
-        return " ".join(strip_prefix(word) for word in text.split())
     articles = ARTICLES.get(language)
     if not articles:
-        # Unknown language: leave the text alone rather than apply English rules.
+        # No article list for this language: leave the text alone rather than
+        # fall back on English rules.
         return text
     pattern = r"\b(" + "|".join(re.escape(article) for article in articles) + r")\b"
-    return re.sub(pattern, " ", text)
+    return white_space_fix(re.sub(pattern, " ", text))
 
 
 def white_space_fix(text: str) -> str:
@@ -155,31 +155,58 @@ def remove_punc(text: str) -> str:
     return prediction
 
 
+def _canonical_form(text: str) -> str:
+    """Lowercased, punctuation-free, single-spaced."""
+    return white_space_fix(remove_punc(text.lower()))
+
+
+def _extract_answer(text: str) -> str:
+    """Drops the preamble and politeness a model wraps its answer in."""
+    if " answer is " in text:
+        return text.split(" answer is ")[-1]
+    if "answer is " in text:
+        return text.replace("answer is ", "")
+    if text.endswith("です"):  # Japanese copula, added for politeness
+        return text[:-2]
+    return text
+
+
+def answer_variants(text: str, language: str = "english") -> List[str]:
+    """
+    The forms an answer may take: as written, and without its articles.
+
+    Scoring matches any variant against any other, so article removal only ever
+    adds a way to match. A wrong article list cannot delete the form that would
+    have matched and turn a correct answer into a miss.
+
+    Empty forms are dropped. An answer of pure punctuation, or a gold answer
+    left blank in the data, would otherwise normalize to "" — and since "" is a
+    substring of everything, a single blank target makes `contains` score 1.0
+    against every prediction. Returns [] when nothing survives.
+    """
+    answer = _extract_answer(_canonical_form(text))
+    variants = [answer, remove_articles(answer, language)]
+    return list(dict.fromkeys(variant for variant in variants if variant))
+
+
 def normalize_answer(text: str, language: str = "english") -> str:
-    base = white_space_fix(remove_punc(text.lower()))
-    prediction = white_space_fix(remove_articles(base, language))
-    if not prediction and base:
-        # The whole answer consisted of article words (eg a bare "the" or
-        # "le"). Stripping it to "" would score any other article-only
-        # prediction as an exact match and give a correct answer an F1 of 0,
-        # so keep the unstripped form instead.
-        prediction = base
-    # Get rid of some common reasoning corrupted answers:
-    if " answer is " in prediction:
-        prediction = prediction.split(" answer is ")[-1]
-    elif "answer is " in prediction:
-        prediction = prediction.replace("answer is ", "")
-    # In Japanese a lot of answers have the copula prepended for extra politeness
-    elif prediction[-2:] == "です":
-        prediction = prediction[:-2]
-    return prediction
+    """The most-normalized single form. Scoring uses answer_variants instead."""
+    return answer_variants(text, language)[-1]
 
 
-def postprocess_answers(input: Union[str, List[str]], language: str = "english") -> Union[str, List[str]]:
-    if isinstance(input, str):
-        return normalize_answer(input, language)
-    else:
-        return [normalize_answer(x, language) for x in input]
+def postprocess_answers(
+    input: Union[str, List[str]], language: str = "english"
+) -> List[str]:
+    """
+    Flattens one answer, or a list of alternative answers, into their variants.
+
+    Deduplicated but ordered: these reach the results JSON, and a set would be
+    neither serializable nor stable across runs (its order depends on
+    PYTHONHASHSEED).
+    """
+    texts = [input] if isinstance(input, str) else input
+    variants = (v for text in texts for v in answer_variants(text, language))
+    return list(dict.fromkeys(variants))
 
 
 def content_language(language_key: str) -> str:
@@ -189,8 +216,8 @@ def content_language(language_key: str) -> str:
     A language key is not a filename. Files are laid out as
     "{source_lang}/{subset}_translated_{human|machine}_{target_lang}.jsonl",
     but main() turns each path into a key by substituting the source language
-    for the subset name, so "russian/dev_translated_human_english.jsonl"
-    becomes "russian_translated_human_english". Prediction files label rows
+    for the subset name, so "spanish/dev_translated_human_english.jsonl"
+    becomes "spanish_translated_human_english". Prediction files label rows
     the same way.
 
     Such a key holds target_lang text, not source: the example above is
@@ -332,18 +359,28 @@ def evaluate_all(reference_answers, our_answers):
         "edit_similarity": edit_similarity,
         "contains": contains,
     }
-    # Compute per example scores
+    # Compute per example scores. Predictions and targets are both variant
+    # lists, so a metric is scored over every pairing and the best is kept:
+    # lowest for edit distance, highest for everything else.
+    lower_is_better = {"edit_distance"}
     results = {}
     for lang, examples in our_answers.items():
         results[lang] = {}
         ref_current = reference_answers[lang]
-        for id, prediction in examples.items():
+        for id, predictions in examples.items():
             results[lang][id] = {}
             targets = [t.lower() for t in ref_current[id]]
+            # A model may answer with nothing at all, leaving no variants.
+            # Score that as the empty string so it lands at zero.
+            predictions = predictions or [""]
             for metric_name, metric in metrics.items():
-                results[lang][id][metric_name] = metric(prediction, targets)
+                scores = [metric(prediction, targets) for prediction in predictions]
+                best = min(scores) if metric_name in lower_is_better else max(scores)
+                results[lang][id][metric_name] = best
             results[lang][id]["targets"] = targets
-            results[lang][id]["prediction"] = prediction
+            # Both sides are variant lists, and both are reported, so a reader
+            # auditing a score can see exactly what was compared against what.
+            results[lang][id]["prediction"] = predictions
         # Now compute aggregate scores for that language
         for metric in metrics:
             count = 0

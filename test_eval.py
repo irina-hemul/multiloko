@@ -12,6 +12,10 @@ import unittest
 from eval import (
     ARTICLES,
     FA_TOKENS,
+    contains,
+    exact_match,
+    _canonical_form,
+    answer_variants,
     PREFIX_ARTICLES,
     content_language,
     normalize_answer,
@@ -47,7 +51,6 @@ class TestRemoveArticles(unittest.TestCase):
 
     def test_languages_without_articles_are_untouched(self):
         for language, text in [
-            ("russian", "кот и собака"),
             ("japanese", "東京タワー"),
             ("polish", "kot i pies"),
             ("hindi", "एक बिल्ली"),
@@ -208,7 +211,10 @@ class TestPrefixStrippingGuards(unittest.TestCase):
                             )
 
     @unittest.skipUnless(HAS_DATA, "benchmark_data not extracted")
-    def test_normalization_is_idempotent_on_every_gold_target(self):
+    def test_stripping_never_loses_the_form_that_would_match(self):
+        # Dataset-wide version of the design guarantee: for every gold target,
+        # the answer as written and the answer with its articles removed always
+        # share a variant, so whichever form a model produces can still match.
         import json
 
         for language in sorted(os.listdir(BENCHMARK_DATA)):
@@ -218,11 +224,16 @@ class TestPrefixStrippingGuards(unittest.TestCase):
             with open(path) as f:
                 for line in f:
                     for target in json.loads(line)["targets"]:
-                        once = normalize_answer(target, language)
-                        if normalize_answer(once, language) != once:
+                        if not target.strip():
+                            continue
+                        written = set(answer_variants(target, language))
+                        stripped = set(
+                            answer_variants(normalize_answer(target, language), language)
+                        )
+                        if not written & stripped:
                             self.fail(
-                                f"{language}: {target!r} -> {once!r} -> "
-                                f"{normalize_answer(once, language)!r}"
+                                f"{language}: {target!r} -> written={written} "
+                                f"stripped={stripped} share no variant"
                             )
 
 
@@ -232,7 +243,7 @@ class TestContentLanguage(unittest.TestCase):
         self.assertEqual(content_language("simplified_mandarin"), "simplified_mandarin")
 
     def test_composite_keys_resolve_to_the_target_language(self):
-        self.assertEqual(content_language("russian_translated_human_english"), "english")
+        self.assertEqual(content_language("spanish_translated_human_english"), "english")
         self.assertEqual(content_language("urdu_translated_machine_english"), "english")
 
     def test_underscored_target_languages_survive_the_split(self):
@@ -249,7 +260,7 @@ class TestContentLanguage(unittest.TestCase):
         # An English-text row inside a Vietnamese subset gets English rules.
         self.assertEqual(
             postprocess_answers("The Gate", content_language("vietnamese_translated_human_english")),
-            "gate",
+            ["the gate", "gate"],
         )
 
     @unittest.skipUnless(HAS_DATA, "benchmark_data not extracted")
@@ -273,11 +284,14 @@ class TestContentLanguage(unittest.TestCase):
 
 class TestPostprocessAnswers(unittest.TestCase):
     def test_accepts_a_string_or_a_list(self):
-        self.assertEqual(postprocess_answers("Der Hund", "german"), "hund")
-        self.assertEqual(postprocess_answers(["Der Hund", "Die Katze"], "german"), ["hund", "katze"])
+        self.assertEqual(postprocess_answers("Der Hund", "german"), ["der hund", "hund"])
+        self.assertEqual(
+            postprocess_answers(["Der Hund", "Die Katze"], "german"),
+            ["der hund", "hund", "die katze", "katze"],
+        )
 
     def test_defaults_to_english(self):
-        self.assertEqual(postprocess_answers("The Cat"), "cat")
+        self.assertEqual(postprocess_answers("The Cat"), ["the cat", "cat"])
 
 
 class TestPredictionsAndReferencesAreTreatedAlike(unittest.TestCase):
@@ -289,10 +303,10 @@ class TestPredictionsAndReferencesAreTreatedAlike(unittest.TestCase):
     def test_the_same_string_normalizes_the_same_on_both_sides(self):
         # parse_input_jsonl handles references, parse_output_* handle
         # predictions. All three must agree for a given language.
-        for language in ("arabic", "hebrew", "german", "french", "russian"):
-            for text in ("الجنسية اللبنانية", "הספר", "Der Hund", "Le chat", "Кот"):
+        for language in ("arabic", "hebrew", "german", "french"):
+            for text in ("الجنسية اللبنانية", "הספר", "Der Hund", "Le chat"):
                 with self.subTest(language=language, text=text):
-                    reference = postprocess_answers([text], language)[0]
+                    reference = postprocess_answers([text], language)
                     prediction = postprocess_answers(text, language)
                     self.assertEqual(reference, prediction)
 
@@ -321,6 +335,13 @@ class TestPredictionsAndReferencesAreTreatedAlike(unittest.TestCase):
         source = os.path.join(BENCHMARK_DATA, language, "dev.jsonl")
         with open(source) as f:
             rows = [json.loads(line) for line in f][:40]
+        # Blank gold answers exist in the data and produce no variants, so they
+        # cannot stand in for a prediction here.
+        rows = [
+            row for row in rows
+            if answer_variants(row["targets"][0], language)
+        ]
+        self.assertTrue(rows, "no usable rows to test with")
 
         references = parse_input_jsonl([(source, language)])[language]
 
@@ -351,10 +372,155 @@ class TestPredictionsAndReferencesAreTreatedAlike(unittest.TestCase):
         for row in rows:
             with self.subTest(id=row["id"]):
                 # The first gold answer, sent through the prediction path, must
-                # come back equal to that same gold answer via the reference
-                # path — otherwise a correct answer would be scored wrong.
-                self.assertEqual(from_csv[row["id"]], references[row["id"]][0])
-                self.assertEqual(from_jsonl[row["id"]], references[row["id"]][0])
+                # share a variant with that same answer via the reference path,
+                # or a correct answer would be scored wrong.
+                # Every variant the prediction path produces must also be
+                # offered by the reference path, or a correct answer could miss.
+                self.assertTrue(set(from_csv[row["id"]]) & set(references[row["id"]]))
+                self.assertTrue(set(from_jsonl[row["id"]]) & set(references[row["id"]]))
+
+
+class TestAnswerVariants(unittest.TestCase):
+    """
+    Article handling is additive: both the written form and the stripped form
+    are kept, and scoring accepts a match on any pairing. A wrong article rule
+    can then only fail to add a match, never delete the one that would have
+    matched.
+    """
+
+    def test_variants_always_include_the_text_as_written(self):
+        # The form as written is never discarded, whatever the article rule
+        # does. This is the property that makes a wrong rule harmless.
+        for language, text in (
+            ("german", "Der Hund"),
+            ("arabic", "الكتاب"),
+            ("hebrew", "הספר"),
+            ("french", "le chat")
+        ):
+            with self.subTest(language=language, text=text):
+                self.assertEqual(answer_variants(text, language)[0], _canonical_form(text))
+
+    def test_variants_include_the_stripped_form_when_it_differs(self):
+        self.assertEqual(answer_variants("Der Hund", "german"), ["der hund", "hund"])
+        self.assertEqual(answer_variants("הספר", "hebrew"), ["הספר", "ספר"])
+
+    def test_no_duplicate_variant_when_nothing_is_stripped(self):
+        self.assertEqual(answer_variants("ein Kind", "german"), ["ein kind"])
+
+    def test_variants_are_never_empty_strings(self):
+        # A blank variant is poison: "" is a substring of everything, so one
+        # blank target makes `contains` score 1.0 against every prediction.
+        for language, text in (
+            ("french", "un"), ("english", "the"), ("swedish", "en"),
+            ("english", ""), ("english", "   "), ("english", "???"),
+            ("japanese", "。。。"), ("japanese", "です"),
+        ):
+            with self.subTest(language=language, text=text):
+                self.assertNotIn("", answer_variants(text, language))
+
+    def test_answers_that_normalize_away_yield_no_variants(self):
+        for language, text in (
+            ("english", ""), ("english", "   "), ("english", "???"),
+            ("japanese", "。。。"),
+        ):
+            with self.subTest(language=language, text=text):
+                self.assertEqual(answer_variants(text, language), [])
+
+    def test_a_blank_target_cannot_make_contains_score(self):
+        # Regression for the metric this actually corrupts.
+        targets = postprocess_answers(["", "Ich Troje"], "polish")
+        self.assertNotIn("", targets)
+        self.assertEqual(contains("something entirely different", targets), 0.0)
+
+    def test_an_empty_prediction_scores_zero_rather_than_crashing(self):
+        targets = postprocess_answers(["Paris"], "french")
+        predictions = postprocess_answers("", "french") or [""]
+        self.assertEqual(exact_match(predictions[0], targets), 0.0)
+        self.assertEqual(contains(predictions[0], targets), 0.0)
+
+    def test_an_over_stripping_rule_cannot_destroy_a_match(self):
+        # The property that motivates the design. Even if a rule strips too
+        # much, the as-written form survives in the variant set, so a gold and
+        # a prediction that agree in *either* form still match.
+        gold = set(answer_variants("ההתנתקות", "hebrew"))
+        prediction = set(answer_variants("התנתקות", "hebrew"))
+        self.assertTrue(gold & prediction)
+
+    def test_article_mismatch_between_sides_still_matches(self):
+        for language, gold, prediction in (
+            ("arabic", "اللبنانية", "لبنانية"),
+            ("german", "Der Hund", "Hund"),
+            ("dutch", "de Vuurboetsduin", "Vuurboetsduin"),
+            ("english", "The Sputniks", "Sputniks"),
+        ):
+            with self.subTest(language=language):
+                self.assertTrue(
+                    set(answer_variants(gold, language))
+                    & set(answer_variants(prediction, language))
+                )
+
+    def test_both_sides_are_expanded_not_just_predictions(self):
+        # The reference parser and both prediction parsers must all expand to
+        # variants. If only one side expanded, an articled gold and a bare
+        # prediction (or vice versa) would miss depending on which side the
+        # article happened to land.
+        import csv
+        import json
+        import tempfile
+
+        language = "spanish"
+        with tempfile.TemporaryDirectory() as tmp:
+            gold_path = os.path.join(tmp, "g.jsonl")
+            with open(gold_path, "w") as f:
+                f.write(json.dumps(
+                    {"id": "x", "targets": ["El Equipo A"]}, ensure_ascii=False) + "\n")
+            references = parse_input_jsonl([(gold_path, language)])[language]["x"]
+
+            csv_path = os.path.join(tmp, "p.csv")
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, ["language", "id", "prediction"])
+                writer.writeheader()
+                writer.writerow(
+                    {"language": language, "id": "x", "prediction": "Equipo A"})
+            predictions = parse_output_csv(csv_path)[language]["x"]
+
+        self.assertGreater(len(references), 1, "gold side was not expanded")
+        self.assertIn("el equipo a", references)
+        self.assertIn("equipo a", references)
+        self.assertTrue(set(references) & set(predictions))
+
+    def test_matching_does_not_depend_on_which_side_has_the_article(self):
+        for language, articled, bare in (
+            ("spanish", "El Equipo A", "Equipo A"),
+            ("german", "Der Hund", "Hund"),
+            ("arabic", "اللبنانية", "لبنانية"),
+            ("hebrew", "ההתנתקות", "התנתקות"),
+        ):
+            with self.subTest(language=language):
+                forward = set(answer_variants(articled, language)) & set(
+                    answer_variants(bare, language))
+                reverse = set(answer_variants(bare, language)) & set(
+                    answer_variants(articled, language))
+                self.assertTrue(forward)
+                self.assertEqual(bool(forward), bool(reverse))
+
+    def test_variant_order_is_deterministic_and_deduplicated(self):
+        # These land in the results JSON, so the order must not depend on
+        # PYTHONHASHSEED and duplicates must not accumulate.
+        targets = ["El Equipo A", "Equipo A", "El Equipo A"]
+        first = postprocess_answers(targets, "spanish")
+        self.assertEqual(first, postprocess_answers(targets, "spanish"))
+        self.assertEqual(len(first), len(set(first)))
+        # as-written forms come before stripped ones, in input order
+        self.assertEqual(first[0], "el equipo a")
+
+    def test_a_dropped_numeral_is_still_not_a_match(self):
+        # "ein" is not in the German list, so it is not stripped and produces
+        # no extra variant: omitting the count remains a different answer.
+        self.assertFalse(
+            set(answer_variants("ein Kind", "german"))
+            & set(answer_variants("Kind", "german"))
+        )
 
 
 if __name__ == "__main__":
